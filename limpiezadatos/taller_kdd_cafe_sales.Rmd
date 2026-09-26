@@ -1,0 +1,434 @@
+---
+title: "Taller: Análisis Exploratorio, Limpieza y Transformación de Datos (KDD)"
+subtitle: "Caso de base de datos suministrados: dirty_cafe_sales.csv"
+author: "David Mauricio Vargas Ramirez ID: 824144"
+date: "2026-09-26"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    latex_engine: pdflatex
+header-includes:
+  - \usepackage[margin=1in]{geometry}
+  - \usepackage{fvextra}
+  - \DefineVerbatimEnvironment{Highlighting}{Verbatim}{breaklines,breakanywhere,commandchars=\\\{\}}
+  - \DefineVerbatimEnvironment{verbatim}{Verbatim}{breaklines,breakanywhere}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, warning = FALSE, message = FALSE, fig.align = "center"
+)
+
+# Reduce el ancho de línea de las salidas de consola (tibbles, summary, etc.)
+# para que quepan dentro del margen de la página en PDF
+options(width = 80)
+
+# Carga de paquetes individuales y utilitarios para evitar fallos de dependencias
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(stringr)
+library(lubridate)
+library(naniar)
+library(janitor)
+library(broom)
+library(zoo)
+```
+
+# Parte 1 — Carga y exploración de datos
+
+```{r carga-exploracion}
+# Lectura con separador ';' debido al formato del archivo delimitado
+cafe_raw <- read_delim("dirty_cafe_sales.csv", delim = ";", show_col_types = FALSE) %>%
+  janitor::clean_names()
+
+str(cafe_raw)
+dplyr::glimpse(cafe_raw)
+```
+
+```{r completitud}
+# Porcentaje de completitud (valores no-NA) por columna
+completitud <- cafe_raw %>%
+  summarise(across(everything(), ~mean(!is.na(.)) * 100)) %>%
+  pivot_longer(everything(), names_to = "columna", values_to = "pct_completo") %>%
+  arrange(pct_completo)
+
+completitud
+```
+
+```{r conteo-problemas}
+# Conteo de NA reales y valores enmascarados como "ERROR" o "UNKNOWN"
+contar_problemas <- function(df, marcadores = c("ERROR", "UNKNOWN")) {
+  df %>%
+    summarise(across(where(is.character), list(
+      NA_real = ~sum(is.na(.)),
+      enmascarado = ~sum(. %in% marcadores, na.rm = TRUE)
+    ))) %>%
+    pivot_longer(everything(), names_to = "campo", values_to = "n") %>%
+    separate(campo, into = c("columna", "tipo_error"), sep = "_(?=[^_]+$)")
+}
+
+tabla_errores <- contar_problemas(cafe_raw)
+tabla_errores
+```
+
+**Respuestas a las preguntas de la Parte 1:**
+
+- **Estructura:** El conjunto de datos contiene 10.000 observaciones y 8 variables. En su estado crudo predominan las variables de tipo carácter (chr), incluso en campos intrínsecamente numéricos (`quantity`, `price_per_unit`, `total_spent`) y de fecha (`transaction_date`) debido a la presencia de cadenas de texto erróneas.
+- **Magnitud de los problemas de calidad:** Se detecta una combinación de valores faltantes estructurales (NA), valores enmascarados bajo etiquetas de error del sistema (ERROR, UNKNOWN) e inconsistencias relacionales entre la cantidad adquirida, el precio unitario y el monto total facturado.
+
+# Parte 2 — Diagnóstico de calidad de datos
+
+```{r diagnostico-na, fig.width=10, fig.height=7, out.width="100%"}
+# Creación de copia diagnóstica convirtiendo cadenas enmascaradas en NA
+cafe_diag <- cafe_raw %>%
+  mutate(across(where(is.character), ~na_if(., "ERROR"))) %>%
+  mutate(across(where(is.character), ~na_if(., "UNKNOWN")))
+
+# Nota metodológica: vis_miss dibuja una línea de 1 píxel por observación.
+# Con 10,000 filas, al reescalar la imagen para el PDF se genera un efecto
+# muaré (interferencia visual) que no refleja ningún error en los datos.
+# Se usa una muestra aleatoria representativa solo para esta visualización;
+# el resto de los diagnósticos y la limpieza siguen usando el dataset completo.
+set.seed(824144)
+cafe_diag_muestra <- cafe_diag %>% slice_sample(n = 1000)
+
+naniar::vis_miss(cafe_diag_muestra, warn_large_data = FALSE) +
+  theme(
+    axis.text.x = element_text(size = 7),
+    plot.margin = margin(t = 5, r = 25, b = 5, l = 5)
+  )
+
+naniar::gg_miss_var(cafe_diag)
+```
+
+```{r variable1-item-precio}
+# Variable 1: Evaluación de Price Per Unit en relación con Item
+cafe_diag %>%
+  group_by(item) %>%
+  summarise(
+    total = n(),
+    pct_na_precio = mean(is.na(price_per_unit)) * 100
+  ) %>%
+  arrange(desc(pct_na_precio))
+```
+
+```{r variable2-location-pago}
+# Variable 2: Evaluación de Payment Method en relación con Location
+cafe_diag %>%
+  group_by(location) %>%
+  summarise(
+    total = n(),
+    pct_na_pago = mean(is.na(payment_method)) * 100
+  ) %>%
+  arrange(desc(pct_na_pago))
+```
+
+**Respuestas a las preguntas orientadoras de la Parte 2:**
+
+**Mecanismos de pérdida:**
+
+- En `price_per_unit`, la tasa de valores faltantes presenta dependencias directas con el tipo de producto (`item`), exhibiendo un comportamiento MAR (Missing at Random). Esto justifica el uso de agrupamientos específicos por producto para recuperar el valor real del catálogo.
+- En `payment_method`, la tasa de pérdida es homogénea entre las sucursales (`location`), sugiriendo un mecanismo MCAR (Missing Completely at Random). Imputar un medio de pago artificial alteraría las proporciones reales de pago, por lo que es metodológicamente correcto mantenerlo como categoría explícita ("No registrado").
+
+# Parte 3 — Limpieza y preparación de datos
+
+```{r pipeline-limpieza}
+# Pipeline de estandarización, tipificación y despeje algebraico
+cafe_clean_base <- cafe_raw %>%
+  mutate(
+    # Estandarización de texto antes de agrupar o tipificar
+    item = str_to_title(str_squish(na_if(na_if(item, "ERROR"), "UNKNOWN"))),
+    payment_method = na_if(na_if(payment_method, "ERROR"), "UNKNOWN"),
+    location = na_if(na_if(location, "ERROR"), "UNKNOWN"),
+    transaction_date = as.Date(transaction_date, tryFormats = c("%Y-%m-%d", "%d/%m/%Y")),
+
+    # Conversión a tipos numéricos
+    quantity = as.numeric(na_if(na_if(quantity, "ERROR"), "UNKNOWN")),
+    price_per_unit = as.numeric(na_if(na_if(price_per_unit, "ERROR"), "UNKNOWN")),
+    total_spent = as.numeric(na_if(na_if(total_spent, "ERROR"), "UNKNOWN"))
+  ) %>%
+  # Despeje relacional de negocio: Total = Cantidad * Precio
+  mutate(
+    price_per_unit = if_else(is.na(price_per_unit) & !is.na(total_spent) & !is.na(quantity) & quantity > 0,
+                             total_spent / quantity, price_per_unit),
+    quantity = if_else(is.na(quantity) & !is.na(total_spent) & !is.na(price_per_unit) & price_per_unit > 0,
+                       round(total_spent / price_per_unit), quantity),
+    total_spent = if_else(is.na(total_spent) & !is.na(quantity) & !is.na(price_per_unit),
+                          quantity * price_per_unit, total_spent)
+  )
+```
+
+```{r imputacion-comparativa}
+# Técnica A: Imputación por mediana según Item
+cafe_clean_mediana <- cafe_clean_base %>%
+  group_by(item) %>%
+  mutate(price_per_unit = if_else(is.na(price_per_unit), median(price_per_unit, na.rm = TRUE), price_per_unit)) %>%
+  ungroup()
+
+# Técnica B: Imputación por media global de referencia
+cafe_clean_media <- cafe_clean_base %>%
+  mutate(price_per_unit = if_else(is.na(price_per_unit), mean(price_per_unit, na.rm = TRUE), price_per_unit))
+
+# Contraste de métricas de dispersión antes y después
+comparativa_precios <- tibble(
+  Metrica = c("Media", "Mediana", "Desv. Estandar"),
+  Original = c(mean(cafe_clean_base$price_per_unit, na.rm = TRUE),
+               median(cafe_clean_base$price_per_unit, na.rm = TRUE),
+               sd(cafe_clean_base$price_per_unit, na.rm = TRUE)),
+  Imp_Mediana_Item = c(mean(cafe_clean_mediana$price_per_unit, na.rm = TRUE),
+                        median(cafe_clean_mediana$price_per_unit, na.rm = TRUE),
+                        sd(cafe_clean_mediana$price_per_unit, na.rm = TRUE)),
+  Imp_Media_Global = c(mean(cafe_clean_media$price_per_unit, na.rm = TRUE),
+                       median(cafe_clean_media$price_per_unit, na.rm = TRUE),
+                       sd(cafe_clean_media$price_per_unit, na.rm = TRUE))
+)
+comparativa_precios
+```
+
+```{r asignacion-final}
+# Asignación final con imputación por ítem y estandarización categórica
+cafe_clean <- cafe_clean_mediana %>%
+  mutate(
+    payment_method = replace_na(payment_method, "No registrado"),
+    location = replace_na(location, "No registrado"),
+    total_spent = if_else(is.na(total_spent), quantity * price_per_unit, total_spent)
+  )
+```
+
+```{r trazabilidad}
+# Cuantificación real de filas afectadas por columna
+pct_total_spent <- mean(is.na(cafe_raw$total_spent) | cafe_raw$total_spent %in% c("ERROR", "UNKNOWN")) * 100
+pct_price_unit  <- mean(is.na(cafe_raw$price_per_unit) | cafe_raw$price_per_unit %in% c("ERROR", "UNKNOWN")) * 100
+pct_pay_method  <- mean(is.na(cafe_raw$payment_method) | cafe_raw$payment_method %in% c("ERROR", "UNKNOWN")) * 100
+
+trazabilidad <- tibble::tribble(
+  ~columna,          ~problema_detectado,          ~tecnica_aplicada,                          ~justificacion,                                            ~pct_filas_afectadas,
+  "Total Spent",     "Valores 'ERROR' y NA",       "Despeje algebraico: Cantidad x Precio",    "Preserva información transaccional sin eliminar filas",   round(pct_total_spent, 2),
+  "Price Per Unit",  "Valores faltantes y ERROR",  "Imputación por mediana según Producto",    "El precio unitario depende estrictamente del producto",   round(pct_price_unit, 2),
+  "Payment Method",  "'UNKNOWN' y NA",             "Categoría explícita 'No registrado'",      "Evita distorsionar las preferencias de pago reales",      round(pct_pay_method, 2)
+)
+trazabilidad
+```
+
+# Parte 4 — Validación de datos
+
+```{r validacion-reglas}
+# Regla 1: total = cantidad * precio unitario
+cafe_val <- cafe_clean %>%
+  mutate(
+    total_calculado = quantity * price_per_unit,
+    viola_regla1 = abs(total_spent - total_calculado) > 0.01
+  )
+
+n_viola1 <- sum(cafe_val$viola_regla1, na.rm = TRUE)
+pct_viola1 <- mean(cafe_val$viola_regla1, na.rm = TRUE) * 100
+
+# Regla 2 (propia): verificación de dispersión (dentro de 3 MAD por ítem)
+cafe_val <- cafe_val %>%
+  group_by(item) %>%
+  mutate(
+    mediana_precio = median(price_per_unit, na.rm = TRUE),
+    mad_precio     = mad(price_per_unit, na.rm = TRUE),
+    viola_regla2   = abs(price_per_unit - mediana_precio) > 3 * mad_precio
+  ) %>%
+  ungroup()
+
+# Decisión programática: recalcular el total cuando exista inconsistencia aritmética
+cafe_val <- cafe_val %>%
+  mutate(total_spent = if_else(viola_regla1, total_calculado, total_spent))
+```
+
+**Respuestas a las preguntas de la Parte 4:**
+
+- **Cuantificación y decisión:** Un total de `r n_viola1` transacciones (`r round(pct_viola1, 2)`%) violaron la igualdad de negocio $Total = Cantidad \times Precio$ y fueron corregidas. Se optó por recalcular `total_spent` a partir de `quantity` y `price_per_unit`, ya que ambas variables representan hechos atómicos de compra.
+- **Riesgos de no validar:** Las inconsistencias numéricas no detienen la ejecución del código, por lo que pasarían desapercibidas en un modelo estadístico, sesgando estimaciones de ingresos.
+
+# Parte 5 — Análisis Exploratorio (EDA)
+
+```{r eda-distribuciones, fig.width=8, fig.height=5}
+# 1. Distribución de variables numéricas continuas
+cafe_val %>%
+  select(quantity, price_per_unit, total_spent) %>%
+  pivot_longer(everything()) %>%
+  ggplot(aes(value)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "white") +
+  facet_wrap(~name, scales = "free") +
+  labs(title = "Distribución de variables numéricas", x = "Valor", y = "Frecuencia") +
+  theme_minimal()
+```
+
+```{r eda-top-items, fig.width=7, fig.height=5}
+# 2. Volumen de ventas por producto (Top Items)
+cafe_val %>%
+  filter(!is.na(item)) %>%
+  count(item, sort = TRUE) %>%
+  ggplot(aes(x = reorder(item, n), y = n)) +
+  geom_col(fill = "coral") +
+  coord_flip() +
+  labs(title = "Transacciones totales por producto", x = "Producto", y = "Frecuencia") +
+  theme_minimal()
+```
+
+```{r outliers}
+# Detección de valores atípicos mediante IQR y Z-Score
+detectar_outliers_iqr <- function(x) {
+  q1 <- quantile(x, 0.25, na.rm = TRUE)
+  q3 <- quantile(x, 0.75, na.rm = TRUE)
+  iqr <- q3 - q1
+  x < (q1 - 1.5 * iqr) | x > (q3 + 1.5 * iqr)
+}
+
+detectar_outliers_zscore <- function(x, umbral = 3) {
+  z <- (x - mean(x, na.rm = TRUE)) / sd(x, na.rm = TRUE)
+  abs(z) > umbral
+}
+
+cafe_val <- cafe_val %>%
+  mutate(
+    outlier_iqr    = detectar_outliers_iqr(total_spent),
+    outlier_zscore = detectar_outliers_zscore(total_spent)
+  )
+
+table(IQR = cafe_val$outlier_iqr, Z_Score = cafe_val$outlier_zscore)
+```
+
+```{r eda-serie-temporal, fig.width=9, fig.height=5}
+# 3. Evolución temporal con promedio móvil a 7 días
+ventas_diarias <- cafe_val %>%
+  filter(!is.na(transaction_date)) %>%
+  group_by(transaction_date) %>%
+  summarise(total_dia = sum(total_spent, na.rm = TRUE)) %>%
+  arrange(transaction_date) %>%
+  mutate(promedio_movil_7d = zoo::rollmean(total_dia, 7, fill = NA, align = "right"))
+
+ggplot(ventas_diarias, aes(x = transaction_date)) +
+  geom_line(aes(y = total_dia), color = "gray60", alpha = 0.6) +
+  geom_line(aes(y = promedio_movil_7d), color = "darkblue", linewidth = 1) +
+  labs(title = "Evolución de ventas diarias y media móvil (7 días)", x = "Fecha", y = "Gasto total diario") +
+  theme_minimal()
+```
+
+```{r eda-boxplot-location, fig.width=7, fig.height=5}
+# 4. Diagrama de caja comparativo por canal de atención
+ggplot(cafe_val, aes(x = location, y = total_spent, fill = location)) +
+  geom_boxplot(show.legend = FALSE, outlier.alpha = 0.3) +
+  labs(title = "Gasto por transacción según ubicación", x = "Ubicación", y = "Gasto total") +
+  theme_minimal()
+```
+
+```{r eda-metodos-pago, fig.width=7, fig.height=5}
+# 5. Frecuencia de uso por método de pago
+cafe_val %>%
+  count(payment_method, sort = TRUE) %>%
+  ggplot(aes(x = reorder(payment_method, n), y = n)) +
+  geom_col(fill = "darkseagreen") +
+  coord_flip() +
+  labs(title = "Distribución de medios de pago", x = "Método de pago", y = "Transacciones") +
+  theme_minimal()
+```
+
+**Respuestas a las preguntas de la Parte 5:**
+
+- **Artículos y medios de pago predominantes:** El producto con mayor rotación se refleja en el gráfico de barras por volumen, mientras que el efectivo y las tarjetas lideran las preferencias transaccionales.
+- **Comparación IQR vs Z-Score:** El método IQR resulta más adecuado para este dataset, ya que `total_spent` presenta asimetría positiva; el Z-Score asume una distribución normal y tiende a subestimar valores extremos en distribuciones sesgadas.
+
+# Parte 6 — Análisis Bivariado e Inferencial
+
+```{r correlacion-spearman}
+# Correlación no paramétrica (Spearman) debido a la asimetría de las distribuciones
+cor.test(cafe_val$quantity, cafe_val$total_spent, method = "spearman")
+```
+
+```{r chi-cuadrado}
+# Prueba de independencia categórica entre Ubicación y Medio de Pago
+tabla_contingencia <- table(cafe_val$payment_method, cafe_val$location)
+chisq.test(tabla_contingencia)
+```
+
+```{r normalidad-comparacion}
+# Evaluación de normalidad y comparación de grupos
+muestra_test <- sample(cafe_val$total_spent[!is.na(cafe_val$total_spent)], min(5000, sum(!is.na(cafe_val$total_spent))))
+shapiro_res <- shapiro.test(muestra_test)
+
+if (shapiro_res$p.value > 0.05) {
+  aov(total_spent ~ location, data = cafe_val) %>% summary()
+} else {
+  # Si no se cumple el supuesto de normalidad, se emplea Kruskal-Wallis
+  kruskal.test(total_spent ~ location, data = cafe_val)
+}
+```
+
+**Respuestas a las preguntas de la Parte 6:**
+
+- **Correlación:** Existe una relación positiva y estadísticamente significativa ($p < 0.05$) entre `quantity` y `total_spent`, confirmando que el volumen de compra individual conduce directamente al valor final del ticket.
+- **Diferencias entre ubicaciones:** Los resultados de la prueba de Kruskal-Wallis y Chi-cuadrado determinan si el comportamiento de compra difiere sustancialmente según la sede o si las diferencias observadas corresponden a variabilidad muestral aleatoria.
+
+# Parte 7 — Transformación de datos (Fase KDD)
+
+```{r variables-temporales}
+# Creación de variables temporales y discretización
+cafe_trans <- cafe_val %>%
+  mutate(
+    dia_semana_num = lubridate::wday(transaction_date),
+    dia_semana     = lubridate::wday(transaction_date, label = TRUE, abbr = TRUE),
+    mes            = lubridate::month(transaction_date, label = TRUE),
+    fin_de_semana  = dia_semana_num %in% c(1, 7),
+    valor_transaccion = if_else(total_spent > median(total_spent, na.rm = TRUE), "Alto", "Bajo")
+  )
+```
+
+```{r one-hot-encoding}
+# Codificación One-Hot para variables categóricas
+cafe_encoded <- cafe_trans %>%
+  mutate(indicador = 1) %>%
+  pivot_wider(
+    names_from = payment_method,
+    values_from = indicador,
+    values_fill = 0,
+    names_prefix = "pago_"
+  ) %>%
+  janitor::clean_names()
+```
+
+```{r estandarizacion-zscore}
+# Estandarización Z-score de la variable de gasto
+cafe_trans <- cafe_trans %>%
+  mutate(total_spent_z = as.numeric(scale(total_spent)))
+```
+
+```{r cubo-analitico}
+# Construcción del cubo analítico agregado para modelado
+dataset_analitico <- cafe_trans %>%
+  group_by(item, location, dia_semana) %>%
+  summarise(
+    ventas_totales   = sum(total_spent, na.rm = TRUE),
+    n_transacciones  = n(),
+    ticket_promedio  = mean(total_spent, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+head(dataset_analitico, 10)
+```
+
+# Parte 8 — Análisis final e interpretación
+
+```{r modelo-regresion}
+# Regresión lineal multivariada exploratoria
+modelo <- lm(ventas_totales ~ n_transacciones + location, data = dataset_analitico)
+summary(modelo)
+broom::tidy(modelo)
+```
+
+## Conclusiones de negocio
+
+- **Volumen transaccional:** El número de transacciones es el predictor más fuerte y estadísticamente significativo ($p < 0.001$) sobre las ventas totales acumuladas.
+- **Eficiencia por canal:** Las ubicaciones operan de forma consistente una vez controlado el flujo de clientes; las estrategias comerciales deben orientarse a la venta cruzada para elevar el ticket promedio por visita.
+- **Calidad de datos:** La corrección relacional y el tratamiento explícito de faltantes evitan el subregistro de ventas y garantizan confiabilidad en los reportes de inventario y facturación.
+
+## Limitaciones
+
+- **Estabilidad de precios:** La imputación de precios unitarios por producto asume precios fijos en el tiempo, sin considerar posibles descuentos temporales o variaciones por promociones.
+- **Supuestos paramétricos:** La presencia de asimetría en el gasto por transacción hace que los estimadores no paramétricos sean más confiables que las medias aritméticas estándar.
